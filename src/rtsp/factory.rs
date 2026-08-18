@@ -320,11 +320,7 @@ fn send_to_sources(
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                )?;
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -1003,9 +999,9 @@ mod tests {
         appsrc.link(&sink).unwrap();
 
         let (observed_tx, observed_rx) = mpsc::channel();
-        sink.static_pad("sink").unwrap().add_probe(
-            PadProbeType::BUFFER,
-            move |_, probe_info| {
+        sink.static_pad("sink")
+            .unwrap()
+            .add_probe(PadProbeType::BUFFER, move |_, probe_info| {
                 let buffer = probe_info.buffer().unwrap();
                 observed_tx
                     .send(ObservedBuffer {
@@ -1016,8 +1012,7 @@ mod tests {
                     })
                     .unwrap();
                 PadProbeReturn::Ok
-            },
-        );
+            });
 
         pipeline.set_state(State::Playing).unwrap();
 
