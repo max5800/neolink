@@ -1,0 +1,196 @@
+name: Validate and publish reviewed GHCR image
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'master'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the proposed PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install GStreamer, protobuf, and build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev \
+            libgtk2.0-dev \
+            protobuf-compiler \
+            libssl-dev
+
+      - name: Install Rust 1.82.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.82.0
+          components: rustfmt
+
+      - name: Format and test the proposed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --workspace --all-features rtsp::factory::tests::exact_size_pool_strategy_grows_with_distinct_frame_sizes -- --exact
+          cargo test --workspace --all-features rtsp::factory::tests::distinct_size_batches_release_owned_frames_and_preserve_metadata -- --exact
+          cargo test --workspace --all-features
+          cargo check --workspace --all-features
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: write
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      PREVIOUS_MASTER_SHA: ${{ github.event.before }}
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify merged PR provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+
+          read -r -a parents <<< "$(git show --no-patch --format=%P "${SOURCE_SHA}")"
+          test "${#parents[@]}" -eq 2
+          test "$(git rev-parse "${SOURCE_SHA}^1")" = "${parents[0]}"
+          test "$(git rev-parse "${SOURCE_SHA}^2")" = "${parents[1]}"
+          test "${parents[0]}" = "${PREVIOUS_MASTER_SHA}"
+
+          response_file="$(mktemp)"
+          trap 'rm -f "${response_file}"' EXIT
+          curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/pulls" \
+            --output "${response_file}"
+
+          pr_head_sha="$(jq --exit-status --raw-output --arg source_sha "${SOURCE_SHA}" '
+            [ .[]
+              | select(.base.ref == "master")
+              | select(.merged_at != null)
+              | select(.draft == false)
+              | select(.merge_commit_sha == $source_sha)
+            ]
+            | if length == 1 then .[0].head.sha else error("expected one matching merged PR") end
+          ' "${response_file}")"
+          test "${pr_head_sha}" = "${parents[1]}"
+
+      - name: Derive immutable image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="${image}:sha-${SOURCE_SHA}"
+          echo "name=${image}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build and publish immutable image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            VERSION=sha-${{ env.SOURCE_SHA }}
+            REPO=${{ github.repository }}
+            OWNER=${{ github.repository_owner }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record source and repository digest
+        id: provenance
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "source_sha=${SOURCE_SHA}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "repository_digest=${DIGEST}"
+            echo "image_by_digest=${IMAGE_NAME}@${DIGEST}"
+          } > ghcr-provenance.txt
+          {
+            echo "### Published GHCR image"
+            echo
+            echo "- Source: \`${SOURCE_SHA}\`"
+            echo "- Immutable tag: \`${IMAGE_TAG}\`"
+            echo "- Repository digest: \`${DIGEST}\`"
+            echo "- Pull by digest: \`${IMAGE_NAME}@${DIGEST}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload digest record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ghcr-provenance-${{ env.SOURCE_SHA }}
+          path: ghcr-provenance.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Verify the package is public
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: ${{ github.event.repository.name }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+          PACKAGE_OWNER_TYPE: ${{ github.event.repository.owner.type }}
+        run: |
+          set -euo pipefail
+          if [[ "${PACKAGE_OWNER_TYPE}" == "Organization" ]]; then
+            package_url="https://api.github.com/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}"
+          else
+            package_url="https://api.github.com/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}"
+          fi
+          visibility="$(curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${package_url}" | jq --raw-output '.visibility')"
+          test "${visibility}" = public

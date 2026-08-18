@@ -1,5 +1,5 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -245,13 +245,11 @@ pub(super) async fn make_factory(
                         std::thread::spawn(move || {
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -264,7 +262,6 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -301,7 +298,6 @@ pub(super) async fn make_factory(
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u32,
@@ -314,12 +310,7 @@ fn send_to_sources(
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -333,7 +324,6 @@ fn send_to_sources(
                     aud_src,
                     adpcm.data,
                     Duration::from_micros(*aud_ts as u64),
-                    pools,
                 )?;
             }
             *aud_ts += duration;
@@ -342,7 +332,7 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
             }
             const MICROSECONDS: u32 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps;
@@ -352,12 +342,7 @@ fn send_to_sources(
     Ok(())
 }
 
-fn send_to_appsrc(
-    appsrc: &AppSrc,
-    data: Vec<u8>,
-    mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -380,36 +365,7 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
-    let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
-    };
+    let buf = buffer_from_owned_data(data, ts);
 
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
@@ -444,6 +400,19 @@ fn send_to_appsrc(
     }
     Ok(())
 }
+
+fn buffer_from_owned_data<T>(data: T, ts: Duration) -> gstreamer::Buffer
+where
+    T: AsMut<[u8]> + Send + 'static,
+{
+    let mut buf = gstreamer::Buffer::from_mut_slice(data);
+    let buf_mut = buf.get_mut().unwrap();
+    let time = ClockTime::from_useconds(ts.as_micros() as u64);
+    buf_mut.set_dts(time);
+    buf_mut.set_pts(time);
+    buf
+}
+
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
     app.pads()
@@ -960,4 +929,139 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gstreamer::{PadProbeReturn, PadProbeType, Pipeline, State};
+    use std::collections::HashMap;
+    use std::sync::mpsc::{self, Sender};
+    use std::time::Duration as StdDuration;
+
+    struct TrackedFrame {
+        bytes: Vec<u8>,
+        released: Sender<()>,
+    }
+
+    impl AsMut<[u8]> for TrackedFrame {
+        fn as_mut(&mut self) -> &mut [u8] {
+            self.bytes.as_mut_slice()
+        }
+    }
+
+    impl Drop for TrackedFrame {
+        fn drop(&mut self) {
+            // A test assertion may already be panicking while GStreamer drops
+            // its final buffer. Do not turn that failure into a Drop panic.
+            let _ = self.released.send(());
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ObservedBuffer {
+        bytes: Vec<u8>,
+        pts: Option<ClockTime>,
+        dts: Option<ClockTime>,
+        duration: Option<ClockTime>,
+    }
+
+    #[test]
+    fn exact_size_pool_strategy_grows_with_distinct_frame_sizes() {
+        gstreamer::init().unwrap();
+        let mut pools = HashMap::new();
+
+        for size in 4096usize..4352 {
+            pools.entry(size).or_insert_with(|| {
+                let pool = gstreamer::BufferPool::new();
+                let mut config = pool.config();
+                config.set_params(None, size as u32, 8, 32);
+                pool.set_config(config).unwrap();
+                pool.set_active(true).unwrap();
+                pool
+            });
+        }
+
+        assert_eq!(pools.len(), 256);
+    }
+
+    #[test]
+    fn distinct_size_batches_release_owned_frames_and_preserve_metadata() {
+        gstreamer::init().unwrap();
+
+        let pipeline = Pipeline::new();
+        let appsrc = ElementFactory::make("appsrc")
+            .build()
+            .unwrap()
+            .dynamic_cast::<AppSrc>()
+            .unwrap();
+        let sink = ElementFactory::make("fakesink").build().unwrap();
+        sink.set_property("sync", false);
+        sink.set_property("async", false);
+        sink.set_property("enable-last-sample", false);
+        pipeline.add_many([appsrc.upcast_ref(), &sink]).unwrap();
+        appsrc.link(&sink).unwrap();
+
+        let (observed_tx, observed_rx) = mpsc::channel();
+        sink.static_pad("sink").unwrap().add_probe(
+            PadProbeType::BUFFER,
+            move |_, probe_info| {
+                let buffer = probe_info.buffer().unwrap();
+                observed_tx
+                    .send(ObservedBuffer {
+                        bytes: buffer.map_readable().unwrap().as_slice().to_vec(),
+                        pts: buffer.pts(),
+                        dts: buffer.dts(),
+                        duration: buffer.duration(),
+                    })
+                    .unwrap();
+                PadProbeReturn::Ok
+            },
+        );
+
+        pipeline.set_state(State::Playing).unwrap();
+
+        let (released_tx, released_rx) = mpsc::channel();
+        let timeout = StdDuration::from_secs(5);
+        for (batch, sizes) in [(0u64, 4096..4224), (1u64, 4224..4352)] {
+            let mut expected = Vec::new();
+            for (index, size) in sizes.enumerate() {
+                let bytes = vec![(size % 251) as u8; size];
+                let timestamp = Duration::from_micros(batch * 1_000_000 + index as u64);
+                expected.push(ObservedBuffer {
+                    bytes: bytes.clone(),
+                    pts: Some(ClockTime::from_useconds(timestamp.as_micros() as u64)),
+                    dts: Some(ClockTime::from_useconds(timestamp.as_micros() as u64)),
+                    duration: None,
+                });
+                appsrc
+                    .push_buffer(buffer_from_owned_data(
+                        TrackedFrame {
+                            bytes,
+                            released: released_tx.clone(),
+                        },
+                        timestamp,
+                    ))
+                    .unwrap();
+            }
+
+            for expected_buffer in expected {
+                assert_eq!(observed_rx.recv_timeout(timeout).unwrap(), expected_buffer);
+            }
+        }
+
+        appsrc.end_of_stream().unwrap();
+        match pipeline.bus().unwrap().timed_pop_filtered(
+            ClockTime::from_seconds(5),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        ) {
+            Some(message) if matches!(message.view(), gstreamer::MessageView::Eos(..)) => {}
+            Some(message) => panic!("Pipeline did not drain successfully: {message:?}"),
+            None => panic!("Timed out waiting for appsrc ! fakesink to drain"),
+        }
+        pipeline.set_state(State::Null).unwrap();
+        for _ in 0..256 {
+            released_rx.recv_timeout(timeout).unwrap();
+        }
+    }
 }
