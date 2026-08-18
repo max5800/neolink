@@ -180,23 +180,58 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Verify the package is public
+      - name: Make the published package public and verify it
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          PACKAGE_NAME: ${{ github.event.repository.name }}
-          PACKAGE_OWNER: ${{ github.repository_owner }}
-          PACKAGE_OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE_NAME: neolink
+          PACKAGE_OWNER: max5800
         run: |
           set -euo pipefail
-          if [[ "${PACKAGE_OWNER_TYPE}" == "Organization" ]]; then
-            package_url="https://api.github.com/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}"
-          else
-            package_url="https://api.github.com/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}"
-          fi
-          visibility="$(curl --fail --silent --show-error \
+          test "${GITHUB_REPOSITORY}" = "${PACKAGE_OWNER}/${PACKAGE_NAME}"
+          package_url="${GITHUB_API_URL}/user/packages/container/${PACKAGE_NAME}"
+
+          update_file="$(mktemp)"
+          readback_file="$(mktemp)"
+          trap 'rm -f "${update_file}" "${readback_file}"' EXIT
+
+          curl --fail --silent --show-error \
+            --request PATCH \
             --header 'Accept: application/vnd.github+json' \
             --header "Authorization: Bearer ${GITHUB_TOKEN}" \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "${package_url}" | jq --raw-output '.visibility')"
+            --header 'Content-Type: application/json' \
+            --data '{"visibility":"public"}' \
+            "${package_url}" \
+            --output "${update_file}"
+
+          jq --exit-status --raw-output \
+            --arg package_name "${PACKAGE_NAME}" \
+            --arg package_owner "${PACKAGE_OWNER}" '
+              if .name == $package_name
+                and .package_type == "container"
+                and .owner.login == $package_owner
+                and .visibility == "public"
+              then .visibility
+              else error("package update returned an unexpected package or visibility")
+              end
+            ' "${update_file}" >/dev/null
+
+          curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${package_url}" \
+            --output "${readback_file}"
+
+          visibility="$(jq --exit-status --raw-output \
+            --arg package_name "${PACKAGE_NAME}" \
+            --arg package_owner "${PACKAGE_OWNER}" '
+              if .name == $package_name
+                and .package_type == "container"
+                and .owner.login == $package_owner
+              then .visibility
+              else error("package readback returned an unexpected package")
+              end
+            ' "${readback_file}")"
           test "${visibility}" = public
