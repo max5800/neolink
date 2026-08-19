@@ -36,6 +36,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
           test "$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" = "bookworm"
           test "$(dpkg --print-architecture)" = "amd64"
+          rustup component add rustfmt --toolchain 1.82.0
           rustc --version
           rustfmt --version
 
