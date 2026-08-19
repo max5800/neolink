@@ -180,62 +180,76 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Verify the published private package and image digest
+      - name: Verify the published private image digest through GHCR
         shell: bash
         env:
+          REGISTRY_USERNAME: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
-          PACKAGE_NAME: neolink
-          PACKAGE_OWNER: max5800
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
           DIGEST: ${{ steps.provenance.outputs.digest }}
         run: |
           set -euo pipefail
-          test "${GITHUB_REPOSITORY}" = "${PACKAGE_OWNER}/${PACKAGE_NAME}"
-          package_url="${GITHUB_API_URL}/user/packages/container/${PACKAGE_NAME}"
-          versions_url="${package_url}/versions?per_page=100"
+          test "${GITHUB_REPOSITORY}" = "max5800/neolink"
+          test "${IMAGE_NAME}" = "ghcr.io/max5800/neolink"
+          test "${IMAGE_TAG}" = "${IMAGE_NAME}:sha-${SOURCE_SHA}"
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
 
-          package_file="$(mktemp)"
-          versions_file="$(mktemp)"
-          trap 'rm -f "${package_file}" "${versions_file}"' EXIT
+          umask 077
+          token_response="$(mktemp)"
+          tag_headers="$(mktemp)"
+          digest_headers="$(mktemp)"
+          chmod 600 "${token_response}" "${tag_headers}" "${digest_headers}"
+          trap 'rm -f -- "${token_response}" "${tag_headers}" "${digest_headers}"' EXIT
 
-          for attempt in {1..12}; do
-            if curl --fail --silent --show-error \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "${package_url}" \
-              --output "${package_file}" \
-              && jq --exit-status \
-                --arg package_name "${PACKAGE_NAME}" \
-                --arg package_owner "${PACKAGE_OWNER}" '
-                  if .name == $package_name
-                    and .package_type == "container"
-                    and .owner.login == $package_owner
-                    and .visibility == "private"
-                  then .visibility
-                  else error("package readback returned an unexpected identity or visibility")
-                  end
-                ' "${package_file}" >/dev/null \
-              && curl --fail --silent --show-error \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "${versions_url}" \
-              --output "${versions_file}" \
-              && jq --exit-status \
-                --arg image_tag "${IMAGE_TAG##*:}" \
-                --arg digest "${DIGEST}" '
-                  [ .[]
-                    | select(.name == $digest)
-                    | select(.metadata.package_type == "container")
-                    | select((.metadata.container.tags | index($image_tag)) != null)
-                  ]
-                  | if length == 1 then .[0].id
-                    else error("expected one private package version bound to the immutable tag and digest")
-                    end
-                ' "${versions_file}" >/dev/null; then
-              exit 0
-            fi
-            sleep 5
-          done
-          exit 1
+          registry_token="$(
+            curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --user "${REGISTRY_USERNAME}:${GITHUB_TOKEN}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:max5800/neolink:pull" \
+              --output "${token_response}"
+            jq --exit-status --raw-output '
+              if type == "object" and (.token | type == "string") and (.token | length > 0)
+              then .token
+              else error("expected a GHCR registry bearer token")
+              end
+            ' "${token_response}"
+          )"
+
+          manifest_accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
+          manifest_url="https://ghcr.io/v2/max5800/neolink/manifests"
+
+          read_manifest_digest() {
+            local reference="$1"
+            local headers="$2"
+            local manifest_digest
+
+            curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --header "Authorization: Bearer ${registry_token}" \
+              --header "Accept: ${manifest_accept}" \
+              --dump-header "${headers}" \
+              --output /dev/null \
+              "${manifest_url}/${reference}"
+
+            manifest_digest="$(awk '
+              /^HTTP\/[0-9.]+ [0-9][0-9][0-9] / {
+                status_count++
+                if ($2 != "200") invalid = 1
+              }
+              tolower($1) == "docker-content-digest:" {
+                digest_count++
+                if (NF != 2) invalid = 1
+                digest = $2
+              }
+              END {
+                if (status_count != 1 || digest_count != 1 || invalid) exit 1
+                print digest
+              }
+            ' "${headers}")"
+            [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf '%s' "${manifest_digest}"
+          }
+
+          tag_digest="$(read_manifest_digest "sha-${SOURCE_SHA}" "${tag_headers}")"
+          test "${tag_digest}" = "${DIGEST}"
+          digest_reference_digest="$(read_manifest_digest "${DIGEST}" "${digest_headers}")"
+          test "${digest_reference_digest}" = "${DIGEST}"
