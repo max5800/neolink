@@ -32,6 +32,7 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
           test "$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" = "bookworm"
           test "$(dpkg --print-architecture)" = "amd64"
