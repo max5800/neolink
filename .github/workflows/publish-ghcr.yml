@@ -102,6 +102,8 @@ jobs:
               -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 \
               install --yes --no-install-recommends \
+              libunwind-14-dev- \
+              libunwind-dev \
               libgstrtspserver-1.0-dev \
               libgstreamer1.0-dev \
               libgtk2.0-dev \
