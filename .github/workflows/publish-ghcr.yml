@@ -20,6 +20,71 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Validate OCI manifest digest header parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf -- "${fixture_dir}"' EXIT
+
+          parse_manifest_digest() {
+            awk '
+              /^HTTP\/[0-9.]+ [0-9][0-9][0-9] / {
+                status_count++
+                if ($2 != "200") invalid = 1
+              }
+              tolower($1) == "docker-content-digest:" {
+                digest_count++
+                if (NF != 2) invalid = 1
+                digest = $2
+                sub(/\r$/, "", digest)
+              }
+              END {
+                if (status_count != 1 || digest_count != 1 || invalid) exit 1
+                print digest
+              }
+            ' "$1"
+          }
+
+          assert_invalid_digest_headers() {
+            local fixture="$1"
+            local parsed_digest
+            if parsed_digest="$(parse_manifest_digest "${fixture}")" \
+              && [[ "${parsed_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid manifest digest header fixture was accepted" >&2
+              return 1
+            fi
+          }
+
+          printf '%s\r\n' \
+            'HTTP/1.1 200 OK' \
+            "Docker-Content-Digest: ${expected_digest}" \
+            '' > "${fixture_dir}/valid"
+          parsed_digest="$(parse_manifest_digest "${fixture_dir}/valid")"
+          test "${parsed_digest}" = "${expected_digest}"
+          test "${#parsed_digest}" -eq 71
+          [[ "${parsed_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${parsed_digest}" != *$'\r'* ]]
+
+          printf '%s\r\n' \
+            'HTTP/1.1 200 OK' \
+            "Docker-Content-Digest: ${expected_digest}" \
+            "Docker-Content-Digest: ${expected_digest}" \
+            '' > "${fixture_dir}/duplicate"
+          assert_invalid_digest_headers "${fixture_dir}/duplicate"
+
+          printf '%s\r\n' \
+            'HTTP/1.1 200 OK' \
+            'Docker-Content-Digest: sha256:not-a-digest' \
+            '' > "${fixture_dir}/malformed"
+          assert_invalid_digest_headers "${fixture_dir}/malformed"
+
+          printf '%s\r\n' \
+            'HTTP/1.1 200 OK' \
+            '' > "${fixture_dir}/missing"
+          assert_invalid_digest_headers "${fixture_dir}/missing"
+
       - name: Install GStreamer, protobuf, and build dependencies
         shell: bash
         run: |
@@ -239,6 +304,7 @@ jobs:
                 digest_count++
                 if (NF != 2) invalid = 1
                 digest = $2
+                sub(/\r$/, "", digest)
               }
               END {
                 if (status_count != 1 || digest_count != 1 || invalid) exit 1
