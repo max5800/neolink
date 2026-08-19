@@ -10,6 +10,7 @@ jobs:
   validate:
     if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'master'
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:
@@ -89,14 +90,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y aptitude
-          sudo aptitude install -y \
-            libgstrtspserver-1.0-dev \
-            libgstreamer1.0-dev \
-            libgtk2.0-dev \
-            protobuf-compiler \
-            libssl-dev
+          timeout --kill-after=30s 20m sudo env DEBIAN_FRONTEND=noninteractive bash -eu -c '
+            apt-get \
+              -o DPkg::Lock::Timeout=120 \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            apt-get \
+              -o DPkg::Lock::Timeout=120 \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              install --yes --no-install-recommends \
+              libgstrtspserver-1.0-dev \
+              libgstreamer1.0-dev \
+              libgtk2.0-dev \
+              protobuf-compiler \
+              libssl-dev
+          '
 
       - name: Install Rust 1.82.0
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
