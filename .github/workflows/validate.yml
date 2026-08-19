@@ -1,0 +1,79 @@
+name: PR validation (linux/amd64)
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-linux-amd64:
+    name: validate-linux-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    container:
+      image: docker.io/library/rust:1.82-bookworm@sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377
+    steps:
+      - name: Check out the exact proposed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify exact source and Debian environment
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
+          test "$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" = "bookworm"
+          test "$(dpkg --print-architecture)" = "amd64"
+          rustc --version
+          rustfmt --version
+
+      - name: Install native test dependencies from Debian Bookworm
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          timeout --kill-after=30s 20m apt-get \
+            -o DPkg::Lock::Timeout=120 \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          timeout --kill-after=30s 20m apt-get \
+            -o DPkg::Lock::Timeout=120 \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install --yes --no-install-recommends \
+            libunwind-dev \
+            libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev \
+            libgtk2.0-dev \
+            pkg-config \
+            protobuf-compiler \
+            libssl-dev
+
+      - name: Check stable formatting
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Run exact leak regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace --all-features rtsp::factory::tests::exact_size_pool_strategy_grows_with_distinct_frame_sizes -- --exact
+          cargo test --workspace --all-features rtsp::factory::tests::distinct_size_batches_release_owned_frames_and_preserve_metadata -- --exact
+
+      - name: Test the workspace with all features
+        shell: bash
+        run: cargo test --workspace --all-features

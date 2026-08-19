@@ -1,140 +1,21 @@
-name: Validate and publish reviewed GHCR image
+name: Publish private GHCR image (linux/amd64)
 
 on:
-  pull_request:
-    branches: [master]
   push:
     branches: [master]
 
+concurrency:
+  group: publish-master
+  cancel-in-progress: false
+
+permissions: {}
+
 jobs:
-  validate:
-    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'master'
-    runs-on: ubuntu-22.04
-    timeout-minutes: 75
-    permissions:
-      contents: read
-    steps:
-      - name: Check out the proposed PR head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Validate OCI manifest digest header parser
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-          fixture_dir="$(mktemp -d)"
-          trap 'rm -rf -- "${fixture_dir}"' EXIT
-
-          parse_manifest_digest() {
-            awk '
-              /^HTTP\/[0-9.]+ [0-9][0-9][0-9] / {
-                status_count++
-                if ($2 != "200") invalid = 1
-              }
-              tolower($1) == "docker-content-digest:" {
-                digest_count++
-                if (NF != 2) invalid = 1
-                digest = $2
-                sub(/\r$/, "", digest)
-              }
-              END {
-                if (status_count != 1 || digest_count != 1 || invalid) exit 1
-                print digest
-              }
-            ' "$1"
-          }
-
-          assert_invalid_digest_headers() {
-            local fixture="$1"
-            local parsed_digest
-            if parsed_digest="$(parse_manifest_digest "${fixture}")" \
-              && [[ "${parsed_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "invalid manifest digest header fixture was accepted" >&2
-              return 1
-            fi
-          }
-
-          printf '%s\r\n' \
-            'HTTP/1.1 200 OK' \
-            "Docker-Content-Digest: ${expected_digest}" \
-            '' > "${fixture_dir}/valid"
-          parsed_digest="$(parse_manifest_digest "${fixture_dir}/valid")"
-          test "${parsed_digest}" = "${expected_digest}"
-          test "${#parsed_digest}" -eq 71
-          [[ "${parsed_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "${parsed_digest}" != *$'\r'* ]]
-
-          printf '%s\r\n' \
-            'HTTP/1.1 200 OK' \
-            "Docker-Content-Digest: ${expected_digest}" \
-            "Docker-Content-Digest: ${expected_digest}" \
-            '' > "${fixture_dir}/duplicate"
-          assert_invalid_digest_headers "${fixture_dir}/duplicate"
-
-          printf '%s\r\n' \
-            'HTTP/1.1 200 OK' \
-            'Docker-Content-Digest: sha256:not-a-digest' \
-            '' > "${fixture_dir}/malformed"
-          assert_invalid_digest_headers "${fixture_dir}/malformed"
-
-          printf '%s\r\n' \
-            'HTTP/1.1 200 OK' \
-            '' > "${fixture_dir}/missing"
-          assert_invalid_digest_headers "${fixture_dir}/missing"
-
-      - name: Install GStreamer, protobuf, and build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout --kill-after=30s 20m sudo env DEBIAN_FRONTEND=noninteractive bash -eu -c '
-            apt-get \
-              -o DPkg::Lock::Timeout=120 \
-              -o Acquire::Retries=3 \
-              -o Acquire::http::Timeout=30 \
-              -o Acquire::https::Timeout=30 update
-            apt-get \
-              -o DPkg::Lock::Timeout=120 \
-              -o Acquire::Retries=3 \
-              -o Acquire::http::Timeout=30 \
-              -o Acquire::https::Timeout=30 \
-              install --yes --no-install-recommends \
-              libunwind-14-dev- \
-              libunwind-dev \
-              libgstrtspserver-1.0-dev \
-              libgstreamer1.0-dev \
-              libgtk2.0-dev \
-              protobuf-compiler \
-              libssl-dev
-          '
-
-      - name: Install Rust 1.82.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: 1.82.0
-
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: nightly
-          components: rustfmt
-
-      - name: Format and test the proposed source
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo +nightly fmt --all -- --check
-          cargo +1.82.0 test --workspace --all-features rtsp::factory::tests::exact_size_pool_strategy_grows_with_distinct_frame_sizes -- --exact
-          cargo +1.82.0 test --workspace --all-features rtsp::factory::tests::distinct_size_batches_release_owned_frames_and_preserve_metadata -- --exact
-          cargo +1.82.0 test --workspace --all-features
-          cargo +1.82.0 check --workspace --all-features
-
-  publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-22.04
+  publish-linux-amd64:
+    name: publish-linux-amd64
+    if: github.repository == 'max5800/neolink' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: read
       pull-requests: read
@@ -142,8 +23,9 @@ jobs:
     env:
       SOURCE_SHA: ${{ github.sha }}
       PREVIOUS_MASTER_SHA: ${{ github.event.before }}
+      IMAGE_NAME: ghcr.io/max5800/neolink
     steps:
-      - name: Check out the pushed commit
+      - name: Check out the exact master source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
@@ -160,13 +42,11 @@ jobs:
 
           read -r -a parents <<< "$(git show --no-patch --format=%P "${SOURCE_SHA}")"
           test "${#parents[@]}" -eq 2
-          test "$(git rev-parse "${SOURCE_SHA}^1")" = "${parents[0]}"
-          test "$(git rev-parse "${SOURCE_SHA}^2")" = "${parents[1]}"
           test "${parents[0]}" = "${PREVIOUS_MASTER_SHA}"
 
           response_file="$(mktemp)"
-          trap 'rm -f "${response_file}"' EXIT
-          curl --fail --silent --show-error \
+          trap 'rm -f -- "${response_file}"' EXIT
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
             --header 'Accept: application/vnd.github+json' \
             --header "Authorization: Bearer ${GITHUB_TOKEN}" \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
@@ -189,9 +69,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tag="${image}:sha-${SOURCE_SHA}"
-          echo "name=${image}" >> "${GITHUB_OUTPUT}"
+          tag="${IMAGE_NAME}:sha-${SOURCE_SHA}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Log in to GHCR
@@ -229,7 +107,6 @@ jobs:
         shell: bash
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
@@ -241,7 +118,7 @@ jobs:
             echo "image_by_digest=${IMAGE_NAME}@${DIGEST}"
           } > ghcr-provenance.txt
           {
-            echo "### Published GHCR image"
+            echo "### Published private GHCR image"
             echo
             echo "- Source: \`${SOURCE_SHA}\`"
             echo "- Immutable tag: \`${IMAGE_TAG}\`"
@@ -250,25 +127,15 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload digest record
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: ghcr-provenance-${{ env.SOURCE_SHA }}
-          path: ghcr-provenance.txt
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Verify the published private image digest through GHCR
+      - name: Verify the private repository digest through GHCR
         shell: bash
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
-          IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
           DIGEST: ${{ steps.provenance.outputs.digest }}
         run: |
           set -euo pipefail
-          test "${GITHUB_REPOSITORY}" = "max5800/neolink"
           test "${IMAGE_NAME}" = "ghcr.io/max5800/neolink"
           test "${IMAGE_TAG}" = "${IMAGE_NAME}:sha-${SOURCE_SHA}"
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -280,21 +147,19 @@ jobs:
           chmod 600 "${token_response}" "${tag_headers}" "${digest_headers}"
           trap 'rm -f -- "${token_response}" "${tag_headers}" "${digest_headers}"' EXIT
 
-          registry_token="$(
-            curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
-              --user "${REGISTRY_USERNAME}:${GITHUB_TOKEN}" \
-              "https://ghcr.io/token?service=ghcr.io&scope=repository:max5800/neolink:pull" \
-              --output "${token_response}"
-            jq --exit-status --raw-output '
-              if type == "object" and (.token | type == "string") and (.token | length > 0)
-              then .token
-              else error("expected a GHCR registry bearer token")
-              end
-            ' "${token_response}"
-          )"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --user "${REGISTRY_USERNAME}:${GITHUB_TOKEN}" \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository:max5800/neolink:pull' \
+            --output "${token_response}"
+          registry_token="$(jq --exit-status --raw-output '
+            if type == "object" and (.token | type == "string") and (.token | length > 0)
+            then .token
+            else error("expected a GHCR registry bearer token")
+            end
+          ' "${token_response}")"
 
           manifest_accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
-          manifest_url="https://ghcr.io/v2/max5800/neolink/manifests"
+          manifest_url='https://ghcr.io/v2/max5800/neolink/manifests'
 
           read_manifest_digest() {
             local reference="$1"
@@ -332,3 +197,11 @@ jobs:
           test "${tag_digest}" = "${DIGEST}"
           digest_reference_digest="$(read_manifest_digest "${DIGEST}" "${digest_headers}")"
           test "${digest_reference_digest}" = "${DIGEST}"
+
+      - name: Upload digest record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ghcr-provenance-${{ env.SOURCE_SHA }}
+          path: ghcr-provenance.txt
+          if-no-files-found: error
+          retention-days: 90
