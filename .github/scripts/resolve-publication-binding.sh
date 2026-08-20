@@ -6,6 +6,23 @@ readonly VALIDATION_PATH=".github/workflows/validate.yml"
 readonly VALIDATION_JOB="validate-linux-amd64"
 readonly MAX_BINDING_ARCHIVE_BYTES=65536
 
+publication_binding_temp_dir=
+
+cleanup_publication_binding_temp_dir() {
+  local exit_status=$? candidate="${publication_binding_temp_dir:-}"
+  publication_binding_temp_dir=
+  trap - EXIT HUP INT TERM
+
+  case "${candidate}" in
+    ''|'/'|'.'|'..') return "${exit_status}" ;;
+  esac
+
+  if ! rm -rf -- "${candidate}" && test "${exit_status}" -eq 0; then
+    exit_status=1
+  fi
+  return "${exit_status}"
+}
+
 select_pr_record() {
   local response="$1" repository="$2" repository_id="$3"
   local merge_sha="$4" previous_sha="$5" reviewed_sha="$6"
@@ -312,8 +329,12 @@ main() {
   local artifact_archive binding_file pr_record validation_record artifact_record
   local pr_number head_ref head_repository head_repository_id run_id check_suite_id
   temp_dir="$(mktemp -d)"
+  publication_binding_temp_dir="${temp_dir}"
+  trap cleanup_publication_binding_temp_dir EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   chmod 700 "${temp_dir}"
-  trap 'rm -rf -- "${temp_dir}"' EXIT
   pr_response="${temp_dir}/pulls.json"; pr_headers="${temp_dir}/pulls.headers"
   runs_response="${temp_dir}/runs.json"; runs_headers="${temp_dir}/runs.headers"
   run_response="${temp_dir}/run.json"; run_headers="${temp_dir}/run.headers"
