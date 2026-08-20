@@ -502,6 +502,14 @@ exact head of one merged pull request and whose `PR validation (linux/amd64)`
 workflow succeeded for that same head SHA. The image is built from that reviewed
 head, not from an unchecked default-branch checkout.
 
+The successful validation uploads a small, exact-run binding artifact that
+records the pull request number, source repository and branch, head and base
+SHAs, workflow ref, run ID, and first run attempt. Publication verifies that
+artifact against the merged pull request and the successful GitHub Actions job.
+This durable evidence remains available when GitHub clears a completed workflow
+run's transient `pull_requests` array after merge. Missing, expired, ambiguous,
+rerun, cross-repository, or mismatched evidence fails closed.
+
 Each accepted source head receives one create-once tag of the form
 `sha-<40-character-head-SHA>`. The workflow refuses to overwrite an existing
 tag and verifies that the tag and its digest reference resolve to the same OCI
