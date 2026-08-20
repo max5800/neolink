@@ -69,6 +69,10 @@ jobs:
         shell: bash
         run: cargo fmt --all -- --check
 
+      - name: Check publication security and AGPL conveyance policy
+        shell: bash
+        run: bash .github/scripts/check-publication-policy.sh
+
       - name: Run exact leak regressions
         shell: bash
         run: |

@@ -494,6 +494,35 @@ docker pull quantumentangledandy/neolink
 docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
 ```
 
+#### Private GHCR release evidence
+
+The publication workflow creates `ghcr.io/max5800/neolink` as a private
+package. It accepts only a two-parent merge to `master` whose second parent is the
+exact head of one merged pull request and whose `PR validation (linux/amd64)`
+workflow succeeded for that same head SHA. The image is built from that reviewed
+head, not from an unchecked default-branch checkout.
+
+Each accepted source head receives one create-once tag of the form
+`sha-<40-character-head-SHA>`. The workflow refuses to overwrite an existing
+tag and verifies that the tag and its digest reference resolve to the same OCI
+digest. Because registry tags are names rather than content identities, use the
+recorded `ghcr.io/max5800/neolink@sha256:<digest>` reference when an immutable
+deployment identity is required. The workflow uploads a 90-day
+`ghcr-provenance-<head-SHA>` artifact containing the merged PR, validation run,
+source SHA, tag, digest, and private-package verification.
+
+GHCR authentication is required to pull the image. Publication fails closed if
+an existing package is not private. After the push, the workflow explicitly
+sets private visibility through the authenticated package API and reads it back;
+first creation therefore cannot pass on an assumed default. A result other than
+verified private visibility fails the run.
+
+The runtime image contains the complete AGPL text at
+`/usr/share/licenses/neolink/LICENSE` and an exact-revision Corresponding Source
+offer at `/usr/share/doc/neolink/SOURCE_OFFER`. The OCI source and license labels
+and both runtime files are checked against the reviewed head before provenance
+is recorded.
+
 #### Environmental Variables
 
 There are currently 2 environmental variables available as part of the container:
