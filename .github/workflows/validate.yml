@@ -61,6 +61,7 @@ jobs:
             libgstrtspserver-1.0-dev \
             libgstreamer1.0-dev \
             libgtk2.0-dev \
+            jq \
             pkg-config \
             protobuf-compiler \
             libssl-dev
