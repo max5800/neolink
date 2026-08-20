@@ -79,20 +79,10 @@ jq --null-input --arg reviewed_sha "${reviewed_sha}" --argjson run_id "${run_id}
     }]
   }' >"${artifacts_file}"
 
-jq --null-input --sort-keys \
-  --arg repository "${repository}" --argjson repository_id "${repository_id}" \
-  --argjson pr_number "${pr_number}" --arg reviewed_sha "${reviewed_sha}" \
-  --arg head_ref "${head_ref}" --arg previous_sha "${previous_sha}" \
-  --argjson run_id "${run_id}" '{
-    schema: "neolink-publication-binding/v1", event_name: "pull_request",
-    repository: $repository, repository_id: $repository_id, pull_request_number: $pr_number,
-    head_sha: $reviewed_sha, head_ref: $head_ref,
-    head_repository: $repository, head_repository_id: $repository_id,
-    base_sha: $previous_sha, base_ref: "master",
-    base_repository: $repository, base_repository_id: $repository_id,
-    run_id: $run_id, run_attempt: 1,
-    workflow_ref: ($repository + "/.github/workflows/validate.yml@refs/pull/" + ($pr_number | tostring) + "/merge")
-  }' >"${binding_file}"
+write_binding_document "${binding_file}" "${repository}" "${repository_id}" "${pr_number}" \
+  "${reviewed_sha}" "${head_ref}" "${repository}" "${repository_id}" \
+  "${previous_sha}" master "${repository}" "${repository_id}" \
+  "${run_id}" 1 "${repository}/.github/workflows/validate.yml@refs/pull/${pr_number}/merge"
 
 expect_failure() {
   if "$@" >/dev/null 2>&1; then

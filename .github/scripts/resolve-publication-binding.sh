@@ -159,6 +159,50 @@ select_binding_artifact() {
     ' "${response}"
 }
 
+write_binding_document() {
+  local output="$1" repository="$2" repository_id="$3" pr_number="$4"
+  local head_sha="$5" head_ref="$6" head_repository="$7" head_repository_id="$8"
+  local base_sha="$9" base_ref="${10}" base_repository="${11}" base_repository_id="${12}"
+  local run_id="${13}" run_attempt="${14}" workflow_ref="${15}"
+
+  jq --null-input --sort-keys \
+    --arg schema 'neolink-publication-binding/v1' \
+    --arg event_name 'pull_request' \
+    --arg repository "${repository}" \
+    --argjson repository_id "${repository_id}" \
+    --argjson pull_request_number "${pr_number}" \
+    --arg head_sha "${head_sha}" \
+    --arg head_ref "${head_ref}" \
+    --arg head_repository "${head_repository}" \
+    --argjson head_repository_id "${head_repository_id}" \
+    --arg base_sha "${base_sha}" \
+    --arg base_ref "${base_ref}" \
+    --arg base_repository "${base_repository}" \
+    --argjson base_repository_id "${base_repository_id}" \
+    --argjson run_id "${run_id}" \
+    --argjson run_attempt "${run_attempt}" \
+    --arg workflow_ref "${workflow_ref}" '
+      {
+        schema: $schema,
+        event_name: $event_name,
+        repository: $repository,
+        repository_id: $repository_id,
+        pull_request_number: $pull_request_number,
+        head_sha: $head_sha,
+        head_ref: $head_ref,
+        head_repository: $head_repository,
+        head_repository_id: $head_repository_id,
+        base_sha: $base_sha,
+        base_ref: $base_ref,
+        base_repository: $base_repository,
+        base_repository_id: $base_repository_id,
+        run_id: $run_id,
+        run_attempt: $run_attempt,
+        workflow_ref: $workflow_ref
+      }
+    ' >"${output}"
+}
+
 verify_binding_document() {
   local binding="$1" repository="$2" repository_id="$3" pr_number="$4"
   local reviewed_sha="$5" head_ref="$6" head_repository="$7" head_repository_id="$8"

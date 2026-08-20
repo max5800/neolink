@@ -114,28 +114,16 @@ jobs:
           [[ "${GITHUB_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
           test "${GITHUB_RUN_ATTEMPT}" = 1
           test "${GITHUB_WORKFLOW_REF}" = "${GITHUB_REPOSITORY}/.github/workflows/validate.yml@refs/pull/${PR_NUMBER}/merge"
-          jq --null-input --sort-keys \
-            --arg schema 'neolink-publication-binding/v1' \
-            --arg event_name "${GITHUB_EVENT_NAME}" \
-            --arg repository "${GITHUB_REPOSITORY}" \
-            --argjson repository_id "${REPOSITORY_ID}" \
-            --argjson pull_request_number "${PR_NUMBER}" \
-            --arg head_sha "${HEAD_SHA}" \
-            --arg head_ref "${HEAD_REF}" \
-            --arg head_repository "${HEAD_REPOSITORY}" \
-            --argjson head_repository_id "${HEAD_REPOSITORY_ID}" \
-            --arg base_sha "${BASE_SHA}" \
-            --arg base_ref "${BASE_REF}" \
-            --arg base_repository "${BASE_REPOSITORY}" \
-            --argjson base_repository_id "${BASE_REPOSITORY_ID}" \
-            --argjson run_id "${GITHUB_RUN_ID}" \
-            --argjson run_attempt "${GITHUB_RUN_ATTEMPT}" \
-            --arg workflow_ref "${GITHUB_WORKFLOW_REF}" \
-            '{schema, event_name, repository, repository_id, pull_request_number,
-              head_sha, head_ref, head_repository, head_repository_id,
-              base_sha, base_ref, base_repository, base_repository_id,
-              run_id, run_attempt, workflow_ref}' > publication-binding.json
-          jq --exit-status 'type == "object"' publication-binding.json >/dev/null
+          source .github/scripts/resolve-publication-binding.sh
+          write_binding_document publication-binding.json \
+            "${GITHUB_REPOSITORY}" "${REPOSITORY_ID}" "${PR_NUMBER}" \
+            "${HEAD_SHA}" "${HEAD_REF}" "${HEAD_REPOSITORY}" "${HEAD_REPOSITORY_ID}" \
+            "${BASE_SHA}" "${BASE_REF}" "${BASE_REPOSITORY}" "${BASE_REPOSITORY_ID}" \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_WORKFLOW_REF}"
+          verify_binding_document publication-binding.json \
+            "${GITHUB_REPOSITORY}" "${REPOSITORY_ID}" "${PR_NUMBER}" \
+            "${HEAD_SHA}" "${HEAD_REF}" "${HEAD_REPOSITORY}" "${HEAD_REPOSITORY_ID}" \
+            "${BASE_SHA}" "${GITHUB_RUN_ID}"
 
       - name: Upload durable publication binding
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
