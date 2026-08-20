@@ -51,6 +51,8 @@ ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
 ARG OWNER
+ARG SOURCE_SHA
+ARG SOURCE_URL="https://github.com/max5800/neolink"
 
 LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
 LABEL repository="$REPO"
@@ -79,6 +81,16 @@ COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \
   /usr/local/bin/neolink
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY LICENSE /usr/share/licenses/neolink/LICENSE
+
+RUN test -n "${SOURCE_SHA}" && \
+    mkdir -p /usr/share/doc/neolink && \
+    printf '%s\n' \
+      'Neolink is conveyed under the GNU Affero General Public License.' \
+      'The complete license is at /usr/share/licenses/neolink/LICENSE.' \
+      "Corresponding Source for this exact image is available at ${SOURCE_URL}/tree/${SOURCE_SHA}." \
+      "Source revision: ${SOURCE_SHA}" \
+      > /usr/share/doc/neolink/SOURCE_OFFER
 
 RUN gst-inspect-1.0; \
     chmod +x "/usr/local/bin/neolink" && \
@@ -90,4 +102,3 @@ ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
 CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
 ENTRYPOINT ["/entrypoint.sh"]
 EXPOSE ${NEO_LINK_PORT}
-

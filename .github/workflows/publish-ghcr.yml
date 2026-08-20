@@ -1,0 +1,420 @@
+name: Publish private GHCR image (linux/amd64)
+
+on:
+  push:
+    branches: [master]
+
+concurrency:
+  group: publish-master
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish-linux-amd64:
+    name: publish-linux-amd64
+    if: github.repository == 'max5800/neolink' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+      pull-requests: read
+    env:
+      MERGE_SHA: ${{ github.sha }}
+      PREVIOUS_MASTER_SHA: ${{ github.event.before }}
+      IMAGE_NAME: ghcr.io/max5800/neolink
+    steps:
+      - name: Check out the exact master merge
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Bind publication to the merged PR and successful exact-head validation
+        id: trust
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${MERGE_SHA}"
+
+          read -r -a parents <<< "$(git show --no-patch --format=%P "${MERGE_SHA}")"
+          test "${#parents[@]}" -eq 2
+          test "${parents[0]}" = "${PREVIOUS_MASTER_SHA}"
+
+          pr_response="$(mktemp)"
+          runs_response="$(mktemp)"
+          jobs_response="$(mktemp)"
+          chmod 600 "${pr_response}" "${runs_response}" "${jobs_response}"
+          trap 'rm -f -- "${pr_response}" "${runs_response}" "${jobs_response}"' EXIT
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/pulls" \
+            --output "${pr_response}"
+
+          pr_record="$(jq --exit-status --compact-output --arg merge_sha "${MERGE_SHA}" --arg head_sha "${parents[1]}" '
+            [ .[]
+              | select(.base.ref == "master")
+              | select(.merged_at != null)
+              | select(.draft == false)
+              | select(.merge_commit_sha == $merge_sha)
+              | select(.head.sha == $head_sha)
+            ]
+            | if length == 1
+              then {number: .[0].number, head_sha: .[0].head.sha}
+              else error("expected one exact merged PR")
+              end
+          ' "${pr_response}")"
+          pr_number="$(jq --exit-status --raw-output '.number' <<< "${pr_record}")"
+          pr_head_sha="$(jq --exit-status --raw-output '.head_sha' <<< "${pr_record}")"
+          [[ "${pr_head_sha}" =~ ^[0-9a-f]{40}$ ]]
+          test "${pr_head_sha}" = "${parents[1]}"
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/validate.yml/runs?head_sha=${pr_head_sha}&event=pull_request&status=success&per_page=100" \
+            --output "${runs_response}"
+
+          validation_record="$(jq --exit-status --compact-output \
+            --arg head_sha "${pr_head_sha}" --argjson pr_number "${pr_number}" '
+            [ .workflow_runs[]
+              | select(.head_sha == $head_sha)
+              | select(.event == "pull_request")
+              | select(.status == "completed")
+              | select(.conclusion == "success")
+              | select(.path == ".github/workflows/validate.yml")
+              | select(any(.pull_requests[]?; .number == $pr_number))
+            ]
+            | sort_by(.run_attempt, .id)
+            | last
+            | if . == null
+              then error("no successful exact-head PR validation run")
+              else {id, html_url, run_attempt}
+              end
+          ' "${runs_response}")"
+          validation_run_id="$(jq --exit-status --raw-output '.id' <<< "${validation_record}")"
+          validation_run_url="$(jq --exit-status --raw-output '.html_url' <<< "${validation_record}")"
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${validation_run_id}/jobs?filter=latest&per_page=100" \
+            --output "${jobs_response}"
+
+          jq --exit-status '
+            [ .jobs[]
+              | select(.name == "validate-linux-amd64")
+              | select(.status == "completed")
+              | select(.conclusion == "success")
+            ]
+            | length == 1
+          ' "${jobs_response}" >/dev/null
+
+          {
+            echo "pr_number=${pr_number}"
+            echo "pr_head_sha=${pr_head_sha}"
+            echo "validation_run_id=${validation_run_id}"
+            echo "validation_run_url=${validation_run_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check out the exact reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ steps.trust.outputs.pr_head_sha }}
+
+      - name: Verify the exact reviewed source checkout
+        shell: bash
+        env:
+          REVIEWED_SOURCE_SHA: ${{ steps.trust.outputs.pr_head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${REVIEWED_SOURCE_SHA}"
+          test "${REVIEWED_SOURCE_SHA}" != "${MERGE_SHA}"
+
+      - name: Derive the create-once source tag
+        id: image
+        shell: bash
+        env:
+          REVIEWED_SOURCE_SHA: ${{ steps.trust.outputs.pr_head_sha }}
+        run: |
+          set -euo pipefail
+          tag_suffix="sha-${REVIEWED_SOURCE_SHA}"
+          echo "tag_suffix=${tag_suffix}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${IMAGE_NAME}:${tag_suffix}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fail closed on package visibility or an existing source tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          TAG_SUFFIX: ${{ steps.image.outputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          umask 077
+          package_response="$(mktemp)"
+          token_response="$(mktemp)"
+          chmod 600 "${package_response}" "${token_response}"
+          trap 'rm -f -- "${package_response}" "${token_response}"' EXIT
+
+          package_status="$(curl --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --output "${package_response}" --write-out '%{http_code}' \
+            'https://api.github.com/user/packages/container/neolink')"
+          case "${package_status}" in
+            200)
+              jq --exit-status '
+                .package_type == "container"
+                and .name == "neolink"
+                and .visibility == "private"
+                and .owner.login == "max5800"
+              ' "${package_response}" >/dev/null
+              ;;
+            404)
+              echo 'No existing package was visible; first creation must pass the post-push private check.'
+              ;;
+            *)
+              echo "Package visibility preflight returned HTTP ${package_status}." >&2
+              exit 1
+              ;;
+          esac
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --user "${REGISTRY_USERNAME}:${GITHUB_TOKEN}" \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository:max5800/neolink:pull' \
+            --output "${token_response}"
+          registry_token="$(jq --exit-status --raw-output '
+            if type == "object" and (.token | type == "string") and (.token | length > 0)
+            then .token
+            else error("expected a GHCR registry bearer token")
+            end
+          ' "${token_response}")"
+
+          tag_status="$(curl --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --request HEAD \
+            --header "Authorization: Bearer ${registry_token}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://ghcr.io/v2/max5800/neolink/manifests/${TAG_SUFFIX}")"
+          case "${tag_status}" in
+            404) ;;
+            200)
+              echo "Refusing to overwrite existing GHCR tag ${TAG_SUFFIX}." >&2
+              exit 1
+              ;;
+            *)
+              echo "GHCR tag preflight returned HTTP ${tag_status}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build and publish the exact reviewed source
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.revision=${{ steps.trust.outputs.pr_head_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            VERSION=sha-${{ steps.trust.outputs.pr_head_sha }}
+            REPO=${{ github.repository }}
+            OWNER=${{ github.repository_owner }}
+            SOURCE_SHA=${{ steps.trust.outputs.pr_head_sha }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify private visibility, OCI identity, and AGPL conveyance
+        id: verify
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          REVIEWED_SOURCE_SHA: ${{ steps.trust.outputs.pr_head_sha }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          TAG_SUFFIX: ${{ steps.image.outputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          test "${IMAGE_TAG}" = "${IMAGE_NAME}:${TAG_SUFFIX}"
+          test "${TAG_SUFFIX}" = "sha-${REVIEWED_SOURCE_SHA}"
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          umask 077
+          package_response="$(mktemp)"
+          token_response="$(mktemp)"
+          tag_headers="$(mktemp)"
+          digest_headers="$(mktemp)"
+          chmod 600 "${package_response}" "${token_response}" "${tag_headers}" "${digest_headers}"
+          trap 'rm -f -- "${package_response}" "${token_response}" "${tag_headers}" "${digest_headers}"' EXIT
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --request PATCH \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'Content-Type: application/json' \
+            --data '{"visibility":"private"}' \
+            'https://api.github.com/user/packages/container/neolink' \
+            --output "${package_response}"
+          jq --exit-status '
+            .package_type == "container"
+            and .name == "neolink"
+            and .visibility == "private"
+            and .owner.login == "max5800"
+          ' "${package_response}" >/dev/null
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/user/packages/container/neolink' \
+            --output "${package_response}"
+          jq --exit-status '
+            .package_type == "container"
+            and .name == "neolink"
+            and .visibility == "private"
+            and .owner.login == "max5800"
+          ' "${package_response}" >/dev/null
+
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --user "${REGISTRY_USERNAME}:${GITHUB_TOKEN}" \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository:max5800/neolink:pull' \
+            --output "${token_response}"
+          registry_token="$(jq --exit-status --raw-output '
+            if type == "object" and (.token | type == "string") and (.token | length > 0)
+            then .token
+            else error("expected a GHCR registry bearer token")
+            end
+          ' "${token_response}")"
+
+          manifest_accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
+          manifest_url='https://ghcr.io/v2/max5800/neolink/manifests'
+
+          read_manifest_digest() {
+            local reference="$1"
+            local headers="$2"
+            local manifest_digest
+
+            curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --header "Authorization: Bearer ${registry_token}" \
+              --header "Accept: ${manifest_accept}" \
+              --dump-header "${headers}" \
+              --output /dev/null \
+              "${manifest_url}/${reference}"
+
+            manifest_digest="$(awk '
+              /^HTTP\/[0-9.]+ [0-9][0-9][0-9] / {
+                status_count++
+                if ($2 != "200") invalid = 1
+              }
+              tolower($1) == "docker-content-digest:" {
+                digest_count++
+                if (NF != 2) invalid = 1
+                digest = $2
+                sub(/\r$/, "", digest)
+              }
+              END {
+                if (status_count != 1 || digest_count != 1 || invalid) exit 1
+                print digest
+              }
+            ' "${headers}")"
+            [[ "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf '%s' "${manifest_digest}"
+          }
+
+          tag_digest="$(read_manifest_digest "${TAG_SUFFIX}" "${tag_headers}")"
+          test "${tag_digest}" = "${DIGEST}"
+          digest_reference_digest="$(read_manifest_digest "${DIGEST}" "${digest_headers}")"
+          test "${digest_reference_digest}" = "${DIGEST}"
+
+          docker pull --platform linux/amd64 "${IMAGE_NAME}@${DIGEST}" >/dev/null
+          test "$(docker image inspect "${IMAGE_NAME}@${DIGEST}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${REVIEWED_SOURCE_SHA}"
+          test "$(docker image inspect "${IMAGE_NAME}@${DIGEST}" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/${GITHUB_REPOSITORY}"
+          test "$(docker image inspect "${IMAGE_NAME}@${DIGEST}" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = "AGPL-3.0-or-later"
+          docker run --rm --platform linux/amd64 \
+            --env EXPECTED_SOURCE_SHA="${REVIEWED_SOURCE_SHA}" \
+            --entrypoint /bin/sh "${IMAGE_NAME}@${DIGEST}" -ec '
+              test -s /usr/share/licenses/neolink/LICENSE
+              grep -Fq "GNU AFFERO GENERAL PUBLIC LICENSE" /usr/share/licenses/neolink/LICENSE
+              test -s /usr/share/doc/neolink/SOURCE_OFFER
+              grep -Fqx "Source revision: ${EXPECTED_SOURCE_SHA}" /usr/share/doc/neolink/SOURCE_OFFER
+              grep -Fq "https://github.com/max5800/neolink/tree/${EXPECTED_SOURCE_SHA}" /usr/share/doc/neolink/SOURCE_OFFER
+            '
+
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record publication evidence
+        shell: bash
+        env:
+          DIGEST: ${{ steps.verify.outputs.digest }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          PR_NUMBER: ${{ steps.trust.outputs.pr_number }}
+          REVIEWED_SOURCE_SHA: ${{ steps.trust.outputs.pr_head_sha }}
+          VALIDATION_RUN_ID: ${{ steps.trust.outputs.validation_run_id }}
+          VALIDATION_RUN_URL: ${{ steps.trust.outputs.validation_run_url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "merge_sha=${MERGE_SHA}"
+            echo "pull_request=${PR_NUMBER}"
+            echo "reviewed_source_sha=${REVIEWED_SOURCE_SHA}"
+            echo "validation_run_id=${VALIDATION_RUN_ID}"
+            echo "validation_run_url=${VALIDATION_RUN_URL}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "repository_digest=${DIGEST}"
+            echo "image_by_digest=${IMAGE_NAME}@${DIGEST}"
+            echo "package_visibility=private"
+            echo "license_path=/usr/share/licenses/neolink/LICENSE"
+            echo "source_offer_path=/usr/share/doc/neolink/SOURCE_OFFER"
+            echo "source_url=https://github.com/${GITHUB_REPOSITORY}/tree/${REVIEWED_SOURCE_SHA}"
+          } > ghcr-provenance.txt
+          {
+            echo "### Published verified private GHCR image"
+            echo
+            echo "- Merged PR: #${PR_NUMBER}"
+            echo "- Reviewed source: ${REVIEWED_SOURCE_SHA}"
+            echo "- Validation run: ${VALIDATION_RUN_URL}"
+            echo "- Create-once tag: ${IMAGE_TAG}"
+            echo "- Repository digest: ${DIGEST}"
+            echo "- Pull by digest: ${IMAGE_NAME}@${DIGEST}"
+            echo "- Package visibility: private (verified after push)"
+            echo "- Runtime AGPL license and source offer: verified"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ghcr-provenance-${{ steps.trust.outputs.pr_head_sha }}
+          path: ghcr-provenance.txt
+          if-no-files-found: error
+          retention-days: 90
