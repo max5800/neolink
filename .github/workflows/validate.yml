@@ -61,6 +61,7 @@ jobs:
             libgstrtspserver-1.0-dev \
             libgstreamer1.0-dev \
             libgtk2.0-dev \
+            jq \
             pkg-config \
             protobuf-compiler \
             libssl-dev
@@ -83,3 +84,51 @@ jobs:
       - name: Test the workspace with all features
         shell: bash
         run: cargo test --workspace --all-features
+
+      - name: Create durable publication binding
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_REPOSITORY_ID: ${{ github.event.pull_request.base.repo.id }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "${GITHUB_EVENT_NAME}" = pull_request
+          test "${GITHUB_REPOSITORY}" = max5800/neolink
+          test "${BASE_REPOSITORY}" = "${GITHUB_REPOSITORY}"
+          test "${HEAD_REPOSITORY}" = "${GITHUB_REPOSITORY}"
+          test "${BASE_REPOSITORY_ID}" = "${REPOSITORY_ID}"
+          test "${HEAD_REPOSITORY_ID}" = "${REPOSITORY_ID}"
+          test "${BASE_REF}" = master
+          [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${GITHUB_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          test "${GITHUB_RUN_ATTEMPT}" = 1
+          test "${GITHUB_WORKFLOW_REF}" = "${GITHUB_REPOSITORY}/.github/workflows/validate.yml@refs/pull/${PR_NUMBER}/merge"
+          source .github/scripts/resolve-publication-binding.sh
+          write_binding_document publication-binding.json \
+            "${GITHUB_REPOSITORY}" "${REPOSITORY_ID}" "${PR_NUMBER}" \
+            "${HEAD_SHA}" "${HEAD_REF}" "${HEAD_REPOSITORY}" "${HEAD_REPOSITORY_ID}" \
+            "${BASE_SHA}" "${BASE_REF}" "${BASE_REPOSITORY}" "${BASE_REPOSITORY_ID}" \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_WORKFLOW_REF}"
+          verify_binding_document publication-binding.json \
+            "${GITHUB_REPOSITORY}" "${REPOSITORY_ID}" "${PR_NUMBER}" \
+            "${HEAD_SHA}" "${HEAD_REF}" "${HEAD_REPOSITORY}" "${HEAD_REPOSITORY_ID}" \
+            "${BASE_SHA}" "${GITHUB_RUN_ID}"
+
+      - name: Upload durable publication binding
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publication-binding-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: publication-binding.json
+          if-no-files-found: error
+          retention-days: 90
